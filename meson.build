@@ -1,5 +1,5 @@
 project('ds250-tool', 'c',
-  version : '0.1.0',
+  version : '1.0.0',
   license : 'BSD-3-Clause',
   meson_version : '>= 0.56',
   default_options : [
