@@ -84,6 +84,15 @@
 #define CH_PRBS_ERR_LO     0x84    /* PRBS_ERR_CNT[7:0] */
 #define CH_PSTLCK_MUX      0xA5    /* [7:5] TX output while locked (001=retimed, 100=gen) */
 
+/* CDR data-rate configuration */
+#define CH_PLL_OV          0x09    /* [2] REG_DIVSEL_OV: 0x18[6:4] overrides divsel */
+#define CH_DIVSEL          0x18    /* [6:4] PDIQ_SEL_DIV: 0=/1 1=/2 2=/4 3=/8 4=/16 */
+#define CH_GRP0_CNT_LO     0x60    /* GRP0_OV_CNT[7:0] */
+#define CH_GRP0_CNT_HI     0x61    /* [7] CNT_DLTA_OV_0, [6:0] GRP0_OV_CNT[14:8] */
+#define CH_GRP1_CNT_LO     0x62    /* GRP1_OV_CNT[7:0] */
+#define CH_GRP1_CNT_HI     0x63    /* [7] CNT_DLTA_OV_1, [6:0] GRP1_OV_CNT[14:8] */
+#define CH_GRP_DLTA        0x64    /* [7:4] GRP0_OV_DLTA[3:0], [3:0] GRP1_OV_DLTA[3:0] */
+
 /* shared registers, reachable with 0xFF[0]=0 (Table 9) */
 #define SH_SMBUS_ADDR      0x00    /* [7:4] strap offset from 0x18 */
 #define SH_EE_STAT         0x05    /* [4] EEPROM_READ_DONE */
@@ -238,7 +247,7 @@ static const char *const e_adapt[4] = {
     "none", "CTLE only", "CTLE->DFE->CTLE", "CTLE->DFE->EQ"
 };
 static const char *const e_fom[4] = {
-    "HEO+VEO", "HEO only", "VEO only", "HEO+VEO"
+    "not valid", "HEO only", "VEO only", "HEO+VEO"
 };
 static const char *const e_dfefom[4] = {
     "invalid", "HEO only", "VEO only", "HEO+VEO"
@@ -1217,6 +1226,142 @@ static int cmd_fir(struct dev *d, int ch, int npos, char **posv)
     return 0;
 }
 
+/* PDIQ_SEL_DIV[2:0] -> divider; index is the raw field value */
+static const uint8_t divsel_tab[5] = { 1, 2, 4, 8, 16 };
+
+static int divsel_encode(unsigned div)
+{
+    for (unsigned i = 0; i < sizeof(divsel_tab); i++)
+        if (divsel_tab[i] == div)
+            return (int)i;
+    return -1;
+}
+
+static void rate_show(struct dev *d, int ch)
+{
+    int r2f  = rd8(d, CH_RATE);
+    int pov  = rd8(d, CH_PLL_OV);
+    int dsel = rd8(d, CH_DIVSEL);
+    int g0l  = rd8(d, CH_GRP0_CNT_LO), g0h = rd8(d, CH_GRP0_CNT_HI);
+    int g1l  = rd8(d, CH_GRP1_CNT_LO), g1h = rd8(d, CH_GRP1_CNT_HI);
+    int dlta = rd8(d, CH_GRP_DLTA),    lmon = rd8(d, CH_EOM_LOCKMON);
+    int link = rd8(d, CH_LINK_STATUS);
+    die_rc(r2f < 0 ? r2f : (link < 0 ? link : 0), "rate register read");
+
+    unsigned divf = ((unsigned)dsel >> 4) & 0x7;
+    unsigned g0   = (((unsigned)g0h & 0x7f) << 8) | (unsigned)g0l;
+    unsigned g1   = (((unsigned)g1h & 0x7f) << 8) | (unsigned)g1l;
+    /* PPM delta is 5 bits: [4] in 0x67, [3:0] in 0x64 */
+    unsigned d0   = ((((unsigned)lmon >> 7) & 1) << 4) | (((unsigned)dlta >> 4) & 0xf);
+    unsigned d1   = ((((unsigned)lmon >> 6) & 1) << 4) | ((unsigned)dlta & 0xf);
+
+    printf("ch%d: RATE[2:0]=%u (rate-table index)  ppm_check=%s\n", ch,
+           ((unsigned)r2f >> 4) & 0x7, ((unsigned)r2f & 0x04) ? "on" : "off");
+    bool div_forced = ((unsigned)pov & 0x04) != 0;
+    printf("ch%d: divsel_override=%s", ch, div_forced ? "on" : "off");
+    if (divf < sizeof(divsel_tab))
+        printf("  divider=/%u", divsel_tab[divf]);
+    else
+        printf("  divider=reserved(%u)", divf);
+    /* 0x18[6:4] only takes effect while 0x09[2] is set; say so rather than
+     * letting a stale field read like the live divider */
+    printf("%s\n", div_forced ? "" : " (field only, not in effect)");
+    printf("ch%d: grp0 manual=%s cnt=%u delta=%u   grp1 manual=%s cnt=%u delta=%u\n",
+           ch, ((unsigned)g0h & 0x80) ? "on" : "off", g0, d0,
+           ((unsigned)g1h & 0x80) ? "on" : "off", g1, d1);
+    printf("ch%d: live  sigdet=%d  cdr_lock=%d\n", ch,
+           ((unsigned)link >> 5) & 1, ((unsigned)link >> 4) & 1);
+}
+
+static int cmd_rate(struct dev *d, int ch, int npos, char **posv)
+{
+    die_rc(sel_ch(d, ch), "channel select");
+
+    if (!npos || !strcmp(posv[0], "show")) {
+        rate_show(d, ch);
+        return 0;
+    }
+
+    if (!strcmp(posv[0], "auto")) {
+        /* back to rate-table auto-detect: drop both manual groups and
+         * release the forced divider so the CDR sweeps again */
+        die_rc(rmw8(d, CH_GRP0_CNT_HI, 0x80, 0x00), "0x61[7] CNT_DLTA_OV_0 clear");
+        die_rc(rmw8(d, CH_GRP1_CNT_HI, 0x80, 0x00), "0x63[7] CNT_DLTA_OV_1 clear");
+        die_rc(rmw8(d, CH_PLL_OV, 0x04, 0x00),      "0x09[2] REG_DIVSEL_OV clear");
+        printf("ch%d: manual rate groups cleared, divider override off "
+               "(rate-table auto-detect)\n", ch);
+        return 0;
+    }
+
+    if (!strcmp(posv[0], "table")) {
+        if (npos < 2)
+            errx(EXIT_USAGE, "rate table needs an index 0..7");
+        unsigned idx = strtoul(posv[1], NULL, 0);
+        if (idx > 7)
+            errx(EXIT_USAGE, "rate-table index %u out of range (0..7)", idx);
+        die_rc(rmw8(d, CH_RATE, 0x70, (uint8_t)(idx << 4)), "0x2F[6:4] RATE");
+        printf("ch%d: RATE[2:0]=%u\n", ch, idx);
+        return 0;
+    }
+
+    if (!strcmp(posv[0], "ppm")) {
+        if (npos < 2)
+            errx(EXIT_USAGE, "rate ppm needs on|off");
+        int on = !strcmp(posv[1], "on");
+        if (!on && strcmp(posv[1], "off"))
+            errx(EXIT_USAGE, "rate ppm takes on|off");
+        die_rc(rmw8(d, CH_RATE, 0x04, on ? 0x04 : 0x00), "0x2F[2] EN_PPM_CHECK");
+        printf("ch%d: EN_PPM_CHECK=%s\n", ch, on ? "on" : "off");
+        return 0;
+    }
+
+    if (!strcmp(posv[0], "manual")) {
+        if (npos < 4)
+            errx(EXIT_USAGE,
+                 "rate manual needs GRP(0|1) COUNT DIV(1|2|4|8|16) [DELTA]");
+        unsigned grp = strtoul(posv[1], NULL, 0);
+        unsigned cnt = strtoul(posv[2], NULL, 0);
+        unsigned div = strtoul(posv[3], NULL, 0);
+        unsigned dlt = (npos >= 5) ? strtoul(posv[4], NULL, 0) : 0;
+        if (grp > 1)
+            errx(EXIT_USAGE, "rate group %u out of range (0|1)", grp);
+        if (cnt > 0x7fff)
+            errx(EXIT_USAGE, "count %u exceeds the 15-bit field", cnt);
+        if (dlt > 0x1f)
+            errx(EXIT_USAGE, "delta %u exceeds the 5-bit field", dlt);
+        int dv = divsel_encode(div);
+        if (dv < 0)
+            errx(EXIT_USAGE, "divider /%u not one of 1|2|4|8|16", div);
+
+        uint8_t lo_reg = grp ? CH_GRP1_CNT_LO : CH_GRP0_CNT_LO;
+        uint8_t hi_reg = grp ? CH_GRP1_CNT_HI : CH_GRP0_CNT_HI;
+
+        /* Program the count before arming the override, so the CDR never
+         * sees a half-written rate. */
+        die_rc(wr8(d, lo_reg, (uint8_t)(cnt & 0xff)), "GRP_OV_CNT[7:0]");
+        die_rc(rmw8(d, hi_reg, 0x7f, (uint8_t)((cnt >> 8) & 0x7f)),
+               "GRP_OV_CNT[14:8]");
+        die_rc(rmw8(d, CH_GRP_DLTA, grp ? 0x0f : 0xf0,
+                    (uint8_t)(grp ? (dlt & 0xf) : ((dlt & 0xf) << 4))),
+               "0x64 GRP_OV_DLTA[3:0]");
+        die_rc(rmw8(d, CH_EOM_LOCKMON, grp ? 0x40 : 0x80,
+                    (uint8_t)(((dlt >> 4) & 1) << (grp ? 6 : 7))),
+               "0x67 GRP_OV_DLTA[4]");
+        /* force the divider, then arm the group */
+        die_rc(rmw8(d, CH_DIVSEL, 0x70, (uint8_t)(dv << 4)),
+               "0x18[6:4] PDIQ_SEL_DIV");
+        die_rc(rmw8(d, CH_PLL_OV, 0x04, 0x04), "0x09[2] REG_DIVSEL_OV");
+        die_rc(rmw8(d, hi_reg, 0x80, 0x80), "CNT_DLTA_OV arm");
+
+        printf("ch%d: grp%u manual rate armed: cnt=%u delta=%u divider=/%u\n",
+               ch, grp, cnt, dlt, div);
+        rate_show(d, ch);
+        return 0;
+    }
+
+    errx(EXIT_USAGE, "rate: unknown subcommand '%s'", posv[0]);
+}
+
 static int cmd_shared(struct dev *d)
 {
     int nquad = d->nch / 4;
@@ -1262,6 +1407,13 @@ static void usage(const char *argv0)
         "  eq -c CH [adapt|auto|set BYTE]\n"
         "                            show/restart/force CTLE boost + adaptation mode\n"
         "  dfe -c CH [on|off]        show or switch the 5-tap DFE\n"
+        "  rate -c CH [show]         CDR rate config: RATE index, divider, manual groups\n"
+        "  rate -c CH auto           drop manual groups + divider force (rate-table detect)\n"
+        "  rate -c CH table 0..7     select a built-in rate-table entry (RATE[2:0])\n"
+        "  rate -c CH ppm on|off     PPM counter as a lock qualifier (0x2F[2])\n"
+        "  rate -c CH manual GRP COUNT DIV [DELTA]\n"
+        "                            program group 0|1 with a manual PPM count and\n"
+        "                            divider 1|2|4|8|16\n"
         "  fir -c CH [set -- PRE MAIN POST | off]\n"
         "                            show or set TX FIR cursors (signed; '--' ends\n"
         "                            option parsing so negative cursors pass through)\n"
@@ -1392,6 +1544,11 @@ int main(int argc, char **argv)
         if (ch < 0)
             errx(EXIT_USAGE, "dfe needs -c CH");
         return cmd_dfe(&d, ch, npos, posv);
+    }
+    if (!strcmp(cmd, "rate")) {
+        if (ch < 0)
+            errx(EXIT_USAGE, "rate needs -c CH");
+        return cmd_rate(&d, ch, npos, posv);
     }
     if (!strcmp(cmd, "fir")) {
         if (ch < 0)

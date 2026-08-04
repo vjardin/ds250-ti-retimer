@@ -166,6 +166,33 @@ ch0: tap1=-3  tap2=+0  tap3=+0  tap4=+0  tap5=+0  (-=boost, +=attenuate)
 # ds250 /dev/i2c-26 0x1a dfe -c 0 off
 ```
 
+### rate — CDR data-rate configuration
+
+The CDR only locks to rates it has been told about. The expected rates
+"must be programmed into the CDR either through the
+rate table or entered manually with the corrected divider settings";
+the documentation adds that the PPM counter (fed by the 25 MHz CAL_CLK)
+"constrains the allowable lock ranges of the CDR".
+
+A channel carrying a rate outside its programmed set therefore sits at
+`sigdet=1 cdr_lock=0` indefinitely — signal present, rate not
+admissible. It looks exactly like a signal-integrity problem and is not
+one, so check this before reaching for `eq`/`dfe`/`fir`.
+
+```
+# ds250 /dev/i2c-25 0x22 rate -c 2
+ch2: RATE[2:0]=5 (rate-table index)  ppm_check=on
+ch2: divsel_override=off  divider=/16 (field only, not in effect)
+ch2: grp0 manual=off cnt=0 delta=0   grp1 manual=off cnt=0 delta=0
+ch2: live  sigdet=1  cdr_lock=0
+
+# ds250 /dev/i2c-25 0x22 rate -c 2 table 0    # pick a rate-table entry
+# ds250 /dev/i2c-25 0x22 rate -c 2 auto       # back to auto-detect
+# ds250 /dev/i2c-25 0x22 rate -c 2 ppm off    # drop PPM as a lock qualifier
+# ds250 /dev/i2c-25 0x22 rate -c 2 manual 0 16500 1 4
+#                                   ^grp ^count ^div ^delta
+```
+
 ### fir — TX FIR pre/main/post cursors
 
 ```
